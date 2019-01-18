@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
+	"github.com/urfave/cli"
+	"io/ioutil"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
-
-	"github.com/urfave/cli"
+	"sort"
 )
 
 var config *Config
@@ -111,6 +112,14 @@ func main() {
 			Usage: "Print default config and exit",
 			Action: func(*cli.Context) {
 				PrintDefaultConfig()
+			},
+			Flags: cliapp.Flags,
+		},
+		{
+			Name:  "clean",
+			Usage: "Clean backup data from shadow folder",
+			Action: func(c *cli.Context) error {
+				return clean(*config, c.Bool("dry-run") || c.GlobalBool("dry-run"))
 			},
 			Flags: cliapp.Flags,
 		},
@@ -251,7 +260,7 @@ func upload(config Config, dryRun bool) error {
 			Config: &config.ClickHouse,
 		}
 		if err := ch.Connect(); err != nil {
-			return fmt.Errorf("can't connect to clickouse for get data path with: %v\nyou can set clickhouse.data_path in config", err)
+			return fmt.Errorf("can't connect to clickhouse to get data path with: %v\nyou can set clickhouse.data_path in config", err)
 		}
 		defer ch.Close()
 		var err error
@@ -266,13 +275,52 @@ func upload(config Config, dryRun bool) error {
 	if err := s3.Connect(); err != nil {
 		return fmt.Errorf("can't connect to s3 with: %v", err)
 	}
+	backupStrategy := config.Backup.Strategy
+	switch backupStrategy {
+	case "tree":
+		err := uploadTree(s3, dataPath)
+		if err != nil {
+			return err
+		}
+	case "archive":
+		err := uploadArchive(s3, dataPath)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported backup strategy")
+	}
+	if err := removeOldBackups(config, s3); err != nil {
+		return fmt.Errorf("can't remove old backups: %v", err)
+	}
+	return nil
+}
+
+func uploadTree(s3 *S3, dataPath string) error {
 	log.Printf("upload metadata")
-	if err := s3.Upload(path.Join(dataPath, "metadata"), "metadata"); err != nil {
-		return fmt.Errorf("can't upload metadata to s3 with: %v", err)
+	if err := s3.UploadDirectory(path.Join(dataPath, "metadata"), "metadata"); err != nil {
+		return fmt.Errorf("can't upload metadata: %v", err)
 	}
 	log.Printf("upload data")
-	if err := s3.Upload(path.Join(dataPath, "shadow"), "shadow"); err != nil {
-		return fmt.Errorf("can't upload metadata to s3 with: %v", err)
+	if err := s3.UploadDirectory(path.Join(dataPath, "shadow"), "shadow"); err != nil {
+		return fmt.Errorf("can't upload data: %v", err)
+	}
+	return nil
+}
+
+func uploadArchive(s3 *S3, dataPath string) error {
+	file, err := ioutil.TempFile("", "*.tar")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	log.Printf("archive data")
+	if err = TarDirs(file, path.Join(dataPath, "shadow"), path.Join(dataPath, "metadata")); err != nil {
+		return fmt.Errorf("error achiving data with: %v", err)
+	}
+	log.Printf("upload data")
+	if err := s3.UploadFile(file.Name(), filepath.Base(file.Name())); err != nil {
+		return fmt.Errorf("can't upload archive to s3 with: %v", err)
 	}
 	return nil
 }
@@ -285,7 +333,7 @@ func download(config Config, dryRun bool) error {
 			Config: &config.ClickHouse,
 		}
 		if err := ch.Connect(); err != nil {
-			return fmt.Errorf("can't connect to clickouse for get data path with: %v\nyou can set clickhouse.data_path in config", err)
+			return fmt.Errorf("can't connect to clickhouse for get data path with: %v\nyou can set clickhouse.data_path in config", err)
 		}
 		defer ch.Close()
 		var err error
@@ -300,11 +348,97 @@ func download(config Config, dryRun bool) error {
 	if err := s3.Connect(); err != nil {
 		return fmt.Errorf("can't connect to s3 with: %v", err)
 	}
-	if err := s3.Download("metadata", path.Join(dataPath, "backup", "metadata")); err != nil {
+	backupStrategy := config.Backup.Strategy
+	switch backupStrategy {
+	case "tree":
+		err := downloadTree(s3, dataPath)
+		if err != nil {
+			return err
+		}
+	case "archive":
+		err := downloadArchive(s3, dataPath)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported backup strategy")
+	}
+	return nil
+}
+
+func downloadTree(s3 *S3, dataPath string) error {
+	if err := s3.DownloadTree("metadata", path.Join(dataPath, "backup", "metadata")); err != nil {
 		return fmt.Errorf("cat't download metadata from s3 with %v", err)
 	}
-	if err := s3.Download("shadow", path.Join(dataPath, "backup", "shadow")); err != nil {
+	if err := s3.DownloadTree("shadow", path.Join(dataPath, "backup", "shadow")); err != nil {
 		return fmt.Errorf("can't download shadow from s3 with %v", err)
+	}
+	return nil
+}
+
+func downloadArchive(_ *S3, _ string) error {
+	return fmt.Errorf("download method for archive backup strategy is not implemented")
+}
+
+func clean(config Config, dryRun bool) error {
+	dataPath := config.ClickHouse.DataPath
+	if dataPath == "" {
+		ch := &ClickHouse{
+			DryRun: dryRun,
+			Config: &config.ClickHouse,
+		}
+		if err := ch.Connect(); err != nil {
+			return fmt.Errorf("can't connect to clickhouse to get data path with: %v\nyou can set clickhouse.data_path in config", err)
+		}
+		defer ch.Close()
+		var err error
+		if dataPath, err = ch.GetDataPath(); err != nil || dataPath == "" {
+			return fmt.Errorf("can't get data path from clickhouse with: %v\nyou can set data_path in config file", err)
+		}
+	}
+	shadowDir := path.Join(dataPath, "shadow")
+	log.Printf("remove contents from directory %v", shadowDir)
+	if !dryRun {
+		if err := cleanDir(shadowDir); err != nil {
+			return fmt.Errorf("can't remove contents from directory %v: %v", shadowDir, err)
+		}
+	}
+	return nil
+}
+
+func cleanDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		err = os.RemoveAll(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeOldBackups(config Config, s3 *S3) error {
+	objects, err := s3.ListObjects(config.S3.Path)
+	if err != nil {
+		return err
+	}
+	backupsToDelete := len(objects) - config.Backup.BackupsToKeep
+	if backupsToDelete > 0 {
+		sort.Slice(objects, func(i, j int) bool {
+			return objects[i].LastModified.Sub(*objects[j].LastModified) < 0
+		})
+		log.Printf("Delete %d objects from s3\n", backupsToDelete)
+		if err := s3.DeleteObjects(objects[:backupsToDelete]); err != nil {
+			return err
+		}
 	}
 	return nil
 }
