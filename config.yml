@@ -16,3 +16,6 @@ s3:
   disable_ssl: false
   disable_progress_bar: false
   prefix_key: ""
+backup:
+  strategy: "archive"
+  backups_to_keep: 10

@@ -22,10 +22,11 @@ COMMANDS:
      tables          Print all tables and exit
      freeze          Freeze all or specific tables. You may use this syntax for specify tables [db].[table]
      upload          Upload 'metadata' and 'shadows' directories to s3. Extra files on s3 will be deleted
-     download        Download 'metadata' and 'shadows' from s3 to backup folder
+     download        Download 'metadata' and 'shadows' from s3 to backup folder. NOT IMPLEMENTED for archive strategy
      create-tables   NOT IMPLEMENTED! Create tables from backup metadata
      restore         Copy data from 'backup' to 'detached' folder and execute ATTACH. You can specify tables [db].[table] and increments via -i flag
      default-config  Print default config and exit
+     clean           Remove contents from 'shadow' directory
      help, h         Shows a list of commands or help for one command
 
 GLOBAL OPTIONS:
@@ -55,4 +56,7 @@ s3:
   disable_ssl: false
   disable_progress_bar: false
   prefix_key: ""
+backup:
+  strategy: tree
+  backups_to_keep: 10
 ```
