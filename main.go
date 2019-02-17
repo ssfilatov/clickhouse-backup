@@ -77,7 +77,7 @@ func main() {
 			Name:  "download",
 			Usage: "Download 'metadata' and 'shadows' from s3 to backup folder",
 			Action: func(c *cli.Context) error {
-				return download(*config, c.Bool("dry-run") || c.GlobalBool("dry-run"))
+				return download(*config, c.Args(), c.Bool("dry-run") || c.GlobalBool("dry-run"))
 			},
 			Flags: cliapp.Flags,
 		},
@@ -167,6 +167,13 @@ func parseArgsForRestore(tables map[string]BackupTable, args []string, increment
 		}
 	}
 	return result, nil
+}
+
+func parseArgsForDownload(args []string) (filename string) {
+	if len(args) == 1 {
+		filename = args[0]
+	}
+	return
 }
 
 func getTables(config Config, args []string) error {
@@ -325,7 +332,7 @@ func uploadArchive(s3 *S3, dataPath string) error {
 	return nil
 }
 
-func download(config Config, dryRun bool) error {
+func download(config Config, args []string, dryRun bool) error {
 	dataPath := config.ClickHouse.DataPath
 	if dataPath == "" {
 		ch := &ClickHouse{
@@ -356,7 +363,11 @@ func download(config Config, dryRun bool) error {
 			return err
 		}
 	case "archive":
-		err := downloadArchive(s3, dataPath)
+		filename := parseArgsForDownload(args)
+		if filename == "" {
+			return fmt.Errorf("argument needs to be passed for download with archive strategy")
+		}
+		err := downloadArchive(s3, dataPath, filename)
 		if err != nil {
 			return err
 		}
@@ -376,8 +387,25 @@ func downloadTree(s3 *S3, dataPath string) error {
 	return nil
 }
 
-func downloadArchive(_ *S3, _ string) error {
-	return fmt.Errorf("download method for archive backup strategy is not implemented")
+func downloadArchive(s3 *S3, dataPath string, filename string) error {
+	if err := s3.DownloadTree("metadata", path.Join(dataPath, "backup", "metadata")); err != nil {
+		return fmt.Errorf("cat't download metadata from s3 with %v", err)
+	}
+	dstPath := path.Join(dataPath, "backup")
+	err := s3.DownloadArchive(filename, dstPath)
+	if err != nil {
+		return fmt.Errorf("error downloading shadow from s3 with %v", err)
+	}
+	archivePath := filepath.Join(dstPath, filepath.Base(filename))
+	defer os.Remove(archivePath)
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("error opening archive: %v", err)
+	}
+	if err := Untar(archiveFile, dstPath); err != nil {
+		return fmt.Errorf("error unarchiving %v", err)
+	}
+	return nil
 }
 
 func clean(config Config, dryRun bool) error {

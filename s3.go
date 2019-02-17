@@ -198,6 +198,36 @@ func (s *S3) DownloadTree(s3Path string, localPath string) error {
 	return nil
 }
 
+// Download - download files from s3Path to localPath
+func (s *S3) DownloadArchive(s3Path string, localPath string) error {
+	if err := os.MkdirAll(localPath, 0755); err != nil {
+		return fmt.Errorf("can't create '%s' with: %v", localPath, err)
+	}
+	downloader := s3manager.NewDownloader(s.session)
+	params := &s3.GetObjectInput{
+		Bucket: aws.String(s.Config.Bucket),
+		Key:    aws.String(path.Join(s.Config.Path, s3Path)),
+	}
+	newFilePath := filepath.Join(localPath, filepath.Base(s3Path))
+	newPath := filepath.Dir(newFilePath)
+	if s.DryRun {
+		log.Printf("Download '%s' to '%s'", s3Path, newFilePath)
+		return nil
+	}
+	if err := os.MkdirAll(newPath, 0644); err != nil {
+		return fmt.Errorf("can't create '%s' with: %v", newPath, err)
+	}
+	f, err := os.Create(newFilePath)
+	if err != nil {
+		return fmt.Errorf("can't open '%s' with %v", newFilePath, err)
+	}
+	if _, err := downloader.DownloadWithContext(aws.BackgroundContext(), f, params); err != nil {
+		return fmt.Errorf("can't download file '%s' with %v", s3Path, err)
+	}
+
+	return nil
+}
+
 // SyncFolderIterator is used to upload a given folder to Amazon S3.
 type SyncFolderIterator struct {
 	bucket         string
